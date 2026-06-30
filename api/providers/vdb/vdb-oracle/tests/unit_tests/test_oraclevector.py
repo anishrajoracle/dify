@@ -12,6 +12,7 @@ import numpy
 import pytest
 from pydantic import ValidationError
 
+from configs.middleware.vdb.oracle_config import OracleConfig
 from core.rag.models.document import Document
 
 TEST_ORACLE_PASSWORD = os.environ.get("DIFY_TEST_ORACLE_PASSWORD") or uuid.uuid4().hex
@@ -120,6 +121,95 @@ def test_oracle_config_validation_pool_settings(oracle_module):
         _config(oracle_module, pool_ping_interval=-1)
 
 
+def test_oracle_vector_index_defaults_are_disabled_ivf_and_cosine(oracle_module):
+    application_config = OracleConfig.model_validate({})
+    provider_config = _config(oracle_module)
+
+    assert application_config.ORACLE_ENABLE_VECTOR_INDEX is False
+    assert application_config.ORACLE_VECTOR_INDEX_TYPE == "IVF"
+    assert application_config.ORACLE_VECTOR_INDEX_DISTANCE == "COSINE"
+    assert provider_config.enable_vector_index is False
+    assert provider_config.vector_index_type == "IVF"
+    assert provider_config.vector_index_distance == "COSINE"
+
+
+@pytest.mark.parametrize(
+    ("index_type", "application_field", "provider_field", "minimum", "maximum"),
+    [
+        ("IVF", "ORACLE_VECTOR_INDEX_ACCURACY", "vector_index_accuracy", 1, 100),
+        ("IVF", "ORACLE_VECTOR_INDEX_PARTITIONS", "vector_index_partitions", 1, 10_000_000),
+        ("HNSW", "ORACLE_VECTOR_INDEX_ACCURACY", "vector_index_accuracy", 1, 100),
+        ("HNSW", "ORACLE_VECTOR_INDEX_NEIGHBORS", "vector_index_neighbors", 2, 2048),
+        ("HNSW", "ORACLE_VECTOR_INDEX_EFCONSTRUCTION", "vector_index_efconstruction", 1, 65535),
+    ],
+)
+def test_oracle_vector_index_parameter_boundaries(
+    oracle_module,
+    index_type,
+    application_field,
+    provider_field,
+    minimum,
+    maximum,
+):
+    application_values = {
+        "ORACLE_ENABLE_VECTOR_INDEX": True,
+        "ORACLE_VECTOR_INDEX_TYPE": index_type,
+    }
+    provider_values = {
+        "enable_vector_index": True,
+        "vector_index_type": index_type,
+    }
+
+    for value in (minimum, maximum):
+        assert OracleConfig.model_validate({**application_values, application_field: value})
+        assert _config(oracle_module, **provider_values, **{provider_field: value})
+
+    for value in (minimum - 1, maximum + 1):
+        with pytest.raises(ValidationError):
+            OracleConfig.model_validate({**application_values, application_field: value})
+        with pytest.raises(ValidationError):
+            _config(oracle_module, **provider_values, **{provider_field: value})
+
+
+def test_oracle_vector_index_validation_ignores_unused_type_specific_parameters(oracle_module):
+    assert OracleConfig.model_validate(
+        {
+            "ORACLE_ENABLE_VECTOR_INDEX": True,
+            "ORACLE_VECTOR_INDEX_TYPE": "IVF",
+            "ORACLE_VECTOR_INDEX_NEIGHBORS": 1,
+            "ORACLE_VECTOR_INDEX_EFCONSTRUCTION": 0,
+        }
+    )
+    assert OracleConfig.model_validate(
+        {
+            "ORACLE_ENABLE_VECTOR_INDEX": True,
+            "ORACLE_VECTOR_INDEX_TYPE": "HNSW",
+            "ORACLE_VECTOR_INDEX_PARTITIONS": 0,
+        }
+    )
+    assert _config(
+        oracle_module,
+        enable_vector_index=True,
+        vector_index_type="IVF",
+        vector_index_neighbors=1,
+        vector_index_efconstruction=0,
+    )
+    assert _config(
+        oracle_module,
+        enable_vector_index=True,
+        vector_index_type="HNSW",
+        vector_index_partitions=0,
+    )
+
+
+def test_oracle_vector_index_rejects_non_cosine_distance(oracle_module):
+    with pytest.raises(ValidationError, match="COSINE"):
+        OracleConfig.model_validate({"ORACLE_VECTOR_INDEX_DISTANCE": "DOT"})
+
+    with pytest.raises(ValidationError, match="COSINE"):
+        _config(oracle_module, vector_index_distance="DOT")
+
+
 def test_oracle_config_validation_autonomous_requirements(oracle_module):
     with pytest.raises(ValidationError, match="config_dir is required"):
         oracle_module.OracleVectorConfig.model_validate(
@@ -134,6 +224,8 @@ def test_init_and_get_type(oracle_module, monkeypatch: pytest.MonkeyPatch):
 
     assert vector.get_type() == "oracle"
     assert vector.table_name == "embedding_collection_1"
+    assert vector.text_index_name == "idx_docs_embedding_collection_1"
+    assert vector.vector_index_name == "embedding_collection_1_vec_idx"
     assert vector.pool is pool
 
 
@@ -428,23 +520,87 @@ def test_create_connection_pool_supports_standard_and_autonomous_paths(oracle_mo
     assert create_pool.call_args.kwargs["wallet_location"] == "/wallet"
 
 
-def test_create_delegates_collection_and_insert(oracle_module):
+def test_create_inserts_before_creating_vector_index(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
-    vector._create_collection = MagicMock()
-    vector.add_texts = MagicMock(return_value=["seg-1"])
+    vector.config = _config(oracle_module, enable_vector_index=True)
+    events = []
+    vector._create_collection = MagicMock(side_effect=lambda _dimension: events.append("schema"))
+    vector.add_texts = MagicMock(side_effect=lambda *_args: events.append("insert") or ["seg-1"])
+    vector._ensure_vector_index = MagicMock(side_effect=lambda: events.append("vector_index"))
+    vector._mark_collection_ready = MagicMock(side_effect=lambda _dimension: events.append("cache"))
+    vector._clear_collection_ready = MagicMock()
     docs = [Document(page_content="doc", metadata={"doc_id": "seg-1"})]
 
     result = vector.create(docs, [[0.1, 0.2]])
 
     assert result == ["seg-1"]
+    assert events == ["schema", "insert", "vector_index", "cache"]
     vector._create_collection.assert_called_once_with(2)
     vector.add_texts.assert_called_once_with(docs, [[0.1, 0.2]])
+    vector._ensure_vector_index.assert_called_once_with()
+    vector._mark_collection_ready.assert_called_once_with(2)
+    vector._clear_collection_ready.assert_not_called()
+
+
+def test_create_does_not_mark_collection_ready_when_vector_index_creation_fails(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.config = _config(oracle_module, enable_vector_index=True)
+    vector._create_collection = MagicMock()
+    vector.add_texts = MagicMock(return_value=["seg-1"])
+    vector._ensure_vector_index = MagicMock(side_effect=RuntimeError("index failed"))
+    vector._mark_collection_ready = MagicMock()
+    vector._clear_collection_ready = MagicMock()
+    docs = [Document(page_content="doc", metadata={"doc_id": "seg-1"})]
+
+    with pytest.raises(RuntimeError, match="index failed"):
+        vector.create(docs, [[0.1, 0.2]])
+
+    vector._mark_collection_ready.assert_not_called()
+    vector._clear_collection_ready.assert_called_once_with()
+
+
+def test_create_skips_vector_index_when_disabled(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.config = _config(oracle_module, enable_vector_index=False)
+    vector._create_collection = MagicMock()
+    vector.add_texts = MagicMock(return_value=["seg-1"])
+    vector._ensure_vector_index = MagicMock()
+    vector._mark_collection_ready = MagicMock()
+    vector._clear_collection_ready = MagicMock()
+    docs = [Document(page_content="doc", metadata={"doc_id": "seg-1"})]
+
+    assert vector.create(docs, [[0.1, 0.2]]) == ["seg-1"]
+
+    vector._ensure_vector_index.assert_not_called()
+    vector._mark_collection_ready.assert_called_once_with(2)
+    vector._clear_collection_ready.assert_not_called()
+
+
+def test_create_skips_vector_index_and_ready_cache_when_no_rows_are_stored(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.config = _config(oracle_module, enable_vector_index=True)
+    vector._create_collection = MagicMock()
+    vector.add_texts = MagicMock(return_value=[])
+    vector._ensure_vector_index = MagicMock()
+    vector._mark_collection_ready = MagicMock()
+    vector._clear_collection_ready = MagicMock()
+    docs = [Document(page_content="doc", metadata={"doc_id": "seg-1"})]
+
+    assert vector.create(docs, [[0.1, 0.2]]) == []
+
+    vector._ensure_vector_index.assert_not_called()
+    vector._mark_collection_ready.assert_not_called()
+    vector._clear_collection_ready.assert_called_once_with()
 
 
 def test_create_validates_embedding_shape(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.config = _config(oracle_module)
     vector._create_collection = MagicMock()
     vector.add_texts = MagicMock()
+    vector._ensure_vector_index = MagicMock()
+    vector._mark_collection_ready = MagicMock()
+    vector._clear_collection_ready = MagicMock()
     docs = [
         Document(page_content="doc-1", metadata={"doc_id": "seg-1"}),
         Document(page_content="doc-2", metadata={"doc_id": "seg-2"}),
@@ -753,6 +909,7 @@ def test_delete_by_ids_batches_large_id_lists(oracle_module):
 def test_search_by_vector_with_threshold_and_filter(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
+    vector.config = _config(oracle_module, enable_vector_index=False)
     vector.input_type_handler = MagicMock()
     vector.output_type_handler = MagicMock()
 
@@ -772,7 +929,10 @@ def test_search_by_vector_with_threshold_and_filter(oracle_module):
     assert docs[0].metadata["score"] == pytest.approx(0.9)
     sql = cursor.execute.call_args.args[0]
     params = cursor.execute.call_args.args[1]
-    assert "fetch first 4 rows only" in sql
+    assert "vector_distance(embedding," in sql
+    assert "COSINE)" in sql
+    assert "fetch exact first 4 rows only" in sql.lower()
+    assert "fetch approx" not in sql.lower()
     assert "JSON_VALUE(meta, '$.document_id') IN (:doc_id_0, :doc_id_1)" in sql
     assert params["doc_id_0"] == "d-1"
     assert params["doc_id_1"] == "d-2"
@@ -782,6 +942,7 @@ def test_search_by_vector_with_threshold_and_filter(oracle_module):
 def test_search_by_vector_batches_large_document_filters(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
+    vector.config = _config(oracle_module)
     vector.input_type_handler = MagicMock()
     vector.output_type_handler = MagicMock()
 
@@ -804,6 +965,7 @@ def test_search_by_vector_batches_large_document_filters(oracle_module):
 def test_search_by_vector_merges_global_top_k_across_document_filter_batches(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
+    vector.config = _config(oracle_module)
     vector.input_type_handler = MagicMock()
     vector.output_type_handler = MagicMock()
 
@@ -851,6 +1013,7 @@ def test_search_by_vector_retries_broken_pipe_without_retaining_partial_results(
 def test_search_by_vector_applies_metadata_conditions(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
+    vector.config = _config(oracle_module)
     vector.input_type_handler = MagicMock()
     vector.output_type_handler = MagicMock()
 
@@ -882,6 +1045,27 @@ def test_search_by_vector_applies_metadata_conditions(oracle_module):
     assert params["metadata_filter_2"] == 2024
     assert params["metadata_filter_3"] == "us"
     assert params["metadata_filter_4"] == "eu"
+
+
+def test_search_by_vector_uses_approximate_cosine_query_when_indexing_is_enabled(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.config = _config(oracle_module, enable_vector_index=True, vector_index_accuracy=90)
+    vector.input_type_handler = MagicMock()
+    vector.output_type_handler = MagicMock()
+
+    cursor = MagicMock()
+    cursor.__iter__.return_value = iter([])
+    vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
+
+    vector.search_by_vector([0.1, 0.2], top_k=8)
+
+    sql = cursor.execute.call_args.args[0]
+    params = cursor.execute.call_args.args[1]
+    assert "vector_distance(embedding," in sql
+    assert "COSINE)" in sql
+    assert "fetch approx first 8 rows only with target accuracy 90" in sql.lower()
+    assert params["query_vector"].dtype == numpy.float32
 
 
 def test_metadata_condition_filter_supports_or_empty_and_not_empty(oracle_module):
@@ -1214,6 +1398,7 @@ def test_search_by_vector_rejects_oversized_metadata_filter_before_connection(or
 def test_search_by_vector_batches_document_ids_with_metadata_and_merges_global_top_k(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
+    vector.config = _config(oracle_module)
     vector.input_type_handler = MagicMock()
     vector.output_type_handler = MagicMock()
     cursor = MagicMock()
@@ -1550,11 +1735,7 @@ def test_create_collection_cache_and_execute_path(oracle_module, monkeypatch: py
     assert any("CREATE INDEX IF NOT EXISTS idx_docs_embedding_collection_1" in sql for sql in executed_sql)
     assert any("SYNC (ON COMMIT)" in sql for sql in executed_sql)
     assert any("ctx_user_indexes" in sql.lower() for sql in executed_sql)
-    oracle_module.redis_client.set.assert_called_once_with(
-        oracle_module.collection_cache_key("collection_1", vector.config),
-        "schema:v2:dimension:2",
-        ex=3600,
-    )
+    oracle_module.redis_client.set.assert_not_called()
 
 
 def test_create_collection_revalidates_unhealthy_schema_on_cache_hit(
@@ -1730,6 +1911,153 @@ def test_create_collection_does_not_cache_when_index_creation_fails(oracle_modul
     oracle_module.redis_client.set.assert_not_called()
 
 
+def test_create_vector_index_creates_ivf_and_verifies_its_health(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.vector_index_name = "embedding_collection_1_vec_idx"
+    vector.config = _config(
+        oracle_module,
+        enable_vector_index=True,
+        vector_index_type="IVF",
+        vector_index_accuracy=80,
+        vector_index_partitions=32,
+    )
+
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        None,
+        ("EMBEDDING_COLLECTION_1", "VECTOR", "NEIGHBOR_PARTITIONS_IVF", "VALID"),
+    ]
+    connection = _connection_with_cursor(cursor)
+
+    vector._create_vector_index(connection)
+
+    vector_index_call = next(
+        call for call in cursor.execute.call_args_list if "DBMS_VECTOR.CREATE_INDEX" in call.args[0]
+    )
+    assert vector_index_call.kwargs["idx_distance_metric"] == "COSINE"
+    assert vector_index_call.kwargs["idx_partitioning_scheme"] == "GLOBAL"
+    assert vector_index_call.kwargs["idx_organization"] == "NEIGHBOR PARTITIONS"
+    assert vector_index_call.kwargs["idx_accuracy"] == 80
+    assert vector_index_call.kwargs["idx_parameters"] == '{"type": "IVF", "partitions": 32}'
+    assert sum("USER_INDEXES" in call.args[0] for call in cursor.execute.call_args_list) == 2
+
+
+def test_create_vector_index_creates_configured_hnsw(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.vector_index_name = "embedding_collection_1_vec_idx"
+    vector.config = _config(
+        oracle_module,
+        enable_vector_index=True,
+        vector_index_type="HNSW",
+        vector_index_neighbors=16,
+        vector_index_efconstruction=128,
+    )
+
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        None,
+        ("EMBEDDING_COLLECTION_1", "VECTOR", "INMEMORY_NEIGHBOR_GRAPH_HNSW", "VALID"),
+    ]
+
+    vector._create_vector_index(_connection_with_cursor(cursor))
+
+    vector_index_call = next(
+        call for call in cursor.execute.call_args_list if "DBMS_VECTOR.CREATE_INDEX" in call.args[0]
+    )
+    assert vector_index_call.kwargs["idx_partitioning_scheme"] is None
+    assert vector_index_call.kwargs["idx_organization"] == "INMEMORY NEIGHBOR GRAPH"
+    assert vector_index_call.kwargs["idx_parameters"] == '{"type": "HNSW", "neighbors": 16, "efConstruction": 128}'
+
+
+def test_create_vector_index_skips_existing_healthy_index(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.vector_index_name = "embedding_collection_1_vec_idx"
+    vector.config = _config(oracle_module, enable_vector_index=True)
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        "EMBEDDING_COLLECTION_1",
+        "VECTOR",
+        "NEIGHBOR_PARTITIONS_IVF",
+        "VALID",
+    )
+
+    vector._create_vector_index(_connection_with_cursor(cursor))
+
+    assert len(cursor.execute.call_args_list) == 1
+    assert "USER_INDEXES" in cursor.execute.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "index_details",
+    [
+        ("OTHER_TABLE", "VECTOR", "NEIGHBOR_PARTITIONS_IVF", "VALID"),
+        ("EMBEDDING_COLLECTION_1", "NORMAL", None, "VALID"),
+        ("EMBEDDING_COLLECTION_1", "VECTOR", "INMEMORY_NEIGHBOR_GRAPH_HNSW", "VALID"),
+        ("EMBEDDING_COLLECTION_1", "VECTOR", "NEIGHBOR_PARTITIONS_IVF", "UNUSABLE"),
+    ],
+)
+def test_create_vector_index_rejects_existing_unhealthy_or_incompatible_index(oracle_module, index_details):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.vector_index_name = "embedding_collection_1_vec_idx"
+    vector.config = _config(oracle_module, enable_vector_index=True)
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = index_details
+
+    with pytest.raises(oracle_module.OracleVectorIndexError, match="not a healthy IVF index"):
+        vector._create_vector_index(_connection_with_cursor(cursor))
+
+    assert len(cursor.execute.call_args_list) == 1
+
+
+def test_create_hnsw_vector_index_reports_vector_pool_exhaustion(oracle_module):
+    class VectorPoolError(Exception):
+        full_code = "ORA-51962"
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.vector_index_name = "embedding_collection_1_vec_idx"
+    vector.config = _config(oracle_module, enable_vector_index=True, vector_index_type="HNSW")
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+
+    def execute(sql, *args, **kwargs):
+        if "DBMS_VECTOR.CREATE_INDEX" in sql:
+            raise VectorPoolError("ORA-51962: vector memory area is out of space")
+
+    cursor.execute.side_effect = execute
+
+    with pytest.raises(oracle_module.OracleVectorIndexError, match="HNSW.*Vector Pool.*VECTOR_MEMORY_SIZE"):
+        vector._create_vector_index(_connection_with_cursor(cursor))
+
+    assert sum("DBMS_VECTOR.CREATE_INDEX" in call.args[0] for call in cursor.execute.call_args_list) == 1
+
+
+def test_ensure_vector_index_serializes_creation_and_commits(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    lock = MagicMock()
+    lock.__enter__.return_value = None
+    lock.__exit__.return_value = None
+    monkeypatch.setattr(oracle_module.redis_client, "lock", MagicMock(return_value=lock))
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector._collection_name = "collection_1"
+    vector._create_vector_index = MagicMock()
+    connection = _connection_with_cursor(MagicMock())
+    vector._get_connection = MagicMock(return_value=connection)
+
+    vector._ensure_vector_index()
+
+    vector._create_vector_index.assert_called_once_with(connection)
+    connection.commit.assert_called_once_with()
+    oracle_module.redis_client.lock.assert_called_once_with("oracle_vector_index_collection_1_lock", timeout=600)
+
+
 def test_oracle_factory_init_vector_uses_existing_or_generated_collection(
     oracle_module, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1753,6 +2081,13 @@ def test_oracle_factory_init_vector_uses_existing_or_generated_collection(
     monkeypatch.setattr(oracle_module.dify_config, "ORACLE_POOL_MAX", 8, raising=False)
     monkeypatch.setattr(oracle_module.dify_config, "ORACLE_POOL_INCREMENT", 2, raising=False)
     monkeypatch.setattr(oracle_module.dify_config, "ORACLE_POOL_PING_INTERVAL", 0, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_ENABLE_VECTOR_INDEX", True, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_VECTOR_INDEX_TYPE", "IVF", raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_VECTOR_INDEX_DISTANCE", "COSINE", raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_VECTOR_INDEX_ACCURACY", 85, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_VECTOR_INDEX_NEIGHBORS", 24, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_VECTOR_INDEX_EFCONSTRUCTION", 160, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_VECTOR_INDEX_PARTITIONS", 48, raising=False)
 
     with patch.object(oracle_module, "OracleVector", return_value="vector") as vector_cls:
         result_1 = factory.init_vector(dataset_with_index, attributes=[], embeddings=MagicMock())
@@ -1765,6 +2100,13 @@ def test_oracle_factory_init_vector_uses_existing_or_generated_collection(
     assert vector_cls.call_args_list[0].kwargs["config"].pool_max == 8
     assert vector_cls.call_args_list[0].kwargs["config"].pool_increment == 2
     assert vector_cls.call_args_list[0].kwargs["config"].pool_ping_interval == 0
+    assert vector_cls.call_args_list[0].kwargs["config"].enable_vector_index is True
+    assert vector_cls.call_args_list[0].kwargs["config"].vector_index_type == "IVF"
+    assert vector_cls.call_args_list[0].kwargs["config"].vector_index_distance == "COSINE"
+    assert vector_cls.call_args_list[0].kwargs["config"].vector_index_accuracy == 85
+    assert vector_cls.call_args_list[0].kwargs["config"].vector_index_neighbors == 24
+    assert vector_cls.call_args_list[0].kwargs["config"].vector_index_efconstruction == 160
+    assert vector_cls.call_args_list[0].kwargs["config"].vector_index_partitions == 48
     assert vector_cls.call_args_list[1].kwargs["collection_name"] == "AUTO_COLLECTION"
     assert dataset_without_index.index_struct is not None
 

@@ -1,4 +1,6 @@
-from pydantic import Field, NonNegativeInt, PositiveInt
+from typing import Literal, Self
+
+from pydantic import Field, NonNegativeInt, PositiveInt, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -62,3 +64,53 @@ class OracleConfig(BaseSettings):
         description="Seconds before a pooled Oracle connection is pinged on acquire; 0 validates every checkout",
         default=0,
     )
+
+    ORACLE_ENABLE_VECTOR_INDEX: bool = Field(
+        description="Create an approximate Oracle VECTOR index after initial Knowledge embeddings are stored",
+        default=False,
+    )
+
+    ORACLE_VECTOR_INDEX_TYPE: Literal["HNSW", "IVF"] = Field(
+        description="Oracle VECTOR index type; HNSW requires a configured Vector Pool on self-managed databases",
+        default="IVF",
+    )
+
+    ORACLE_VECTOR_INDEX_DISTANCE: Literal["COSINE"] = Field(
+        description="Distance metric for Oracle Knowledge vector indexes; must match COSINE retrieval semantics",
+        default="COSINE",
+    )
+
+    ORACLE_VECTOR_INDEX_ACCURACY: int = Field(
+        description="Target accuracy percentage for approximate Oracle vector search (1-100)",
+        default=95,
+    )
+
+    ORACLE_VECTOR_INDEX_NEIGHBORS: int = Field(
+        description="HNSW maximum neighbors per vector (2-2048)",
+        default=32,
+    )
+
+    ORACLE_VECTOR_INDEX_EFCONSTRUCTION: int = Field(
+        description="HNSW construction candidate limit (1-65535)",
+        default=200,
+    )
+
+    ORACLE_VECTOR_INDEX_PARTITIONS: int = Field(
+        description="IVF target number of neighbor partitions (1-10000000)",
+        default=64,
+    )
+
+    @model_validator(mode="after")
+    def validate_vector_index_config(self) -> Self:
+        if not self.ORACLE_ENABLE_VECTOR_INDEX:
+            return self
+        if not 1 <= self.ORACLE_VECTOR_INDEX_ACCURACY <= 100:
+            raise ValueError("ORACLE_VECTOR_INDEX_ACCURACY must be between 1 and 100")
+        if self.ORACLE_VECTOR_INDEX_TYPE == "HNSW":
+            if not 2 <= self.ORACLE_VECTOR_INDEX_NEIGHBORS <= 2048:
+                raise ValueError("ORACLE_VECTOR_INDEX_NEIGHBORS must be between 2 and 2048 for HNSW")
+            if not 1 <= self.ORACLE_VECTOR_INDEX_EFCONSTRUCTION <= 65535:
+                raise ValueError("ORACLE_VECTOR_INDEX_EFCONSTRUCTION must be between 1 and 65535 for HNSW")
+        elif not 1 <= self.ORACLE_VECTOR_INDEX_PARTITIONS <= 10_000_000:
+            raise ValueError("ORACLE_VECTOR_INDEX_PARTITIONS must be between 1 and 10000000 for IVF")
+        return self

@@ -74,6 +74,23 @@ ORACLE_TEXT_LEXER_PREFERENCE = "WORLD_LEXER"
 ORACLE_TEXT_LEXER_TYPE = "WORLD_LEXER"
 ORACLE_VECTOR_INFO_PATTERN = re.compile(r"^VECTOR\((\*|\d+)\s*,\s*([^,)]+)(?:,\s*([^)]+))?\)$")
 ORACLE_COLLECTION_SCHEMA_CACHE_VERSION = "v2"
+ORACLE_VECTOR_INDEX_TYPES = {"HNSW", "IVF"}
+ORACLE_VECTOR_INDEX_ORGANIZATIONS = {
+    "HNSW": "INMEMORY NEIGHBOR GRAPH",
+    "IVF": "NEIGHBOR PARTITIONS",
+}
+ORACLE_VECTOR_INDEX_SUBTYPES = {
+    "HNSW": "INMEMORY_NEIGHBOR_GRAPH_HNSW",
+    "IVF": "NEIGHBOR_PARTITIONS_IVF",
+}
+ORACLE_VECTOR_INDEX_DISTANCE = "COSINE"
+ORACLE_VECTOR_INDEX_NAME_MAX_LENGTH = 128
+ORACLE_HNSW_MEMORY_ERROR_CODE = "ORA-51962"
+ORACLE_VECTOR_INDEX_LOCK_TIMEOUT = 600
+
+
+class OracleVectorIndexError(RuntimeError):
+    """Raised when an optional Oracle vector index cannot be created or verified as usable."""
 
 
 class _OraclePoolParams(TypedDict, total=False):
@@ -101,6 +118,13 @@ class OracleVectorConfig(BaseModel):
     pool_max: int = 5
     pool_increment: int = 1
     pool_ping_interval: int = 0
+    enable_vector_index: bool = False
+    vector_index_type: str = "IVF"
+    vector_index_distance: str = ORACLE_VECTOR_INDEX_DISTANCE
+    vector_index_accuracy: int = 95
+    vector_index_neighbors: int = 32
+    vector_index_efconstruction: int = 200
+    vector_index_partitions: int = 64
 
     @model_validator(mode="before")
     @classmethod
@@ -133,6 +157,27 @@ class OracleVectorConfig(BaseModel):
             raise ValueError("pool_ping_interval must be greater than or equal to 0")
         if self.pool_min > self.pool_max:
             raise ValueError("pool_min must be less than or equal to pool_max")
+        return self
+
+    @model_validator(mode="after")
+    def validate_vector_index_config(self):
+        self.vector_index_type = self.vector_index_type.upper()
+        self.vector_index_distance = self.vector_index_distance.upper()
+        if self.vector_index_type not in ORACLE_VECTOR_INDEX_TYPES:
+            raise ValueError("vector_index_type must be 'HNSW' or 'IVF'")
+        if self.vector_index_distance != ORACLE_VECTOR_INDEX_DISTANCE:
+            raise ValueError("vector_index_distance must be COSINE to match Oracle retrieval scoring")
+        if not self.enable_vector_index:
+            return self
+        if not 1 <= self.vector_index_accuracy <= 100:
+            raise ValueError("vector_index_accuracy must be between 1 and 100")
+        if self.vector_index_type == "HNSW":
+            if not 2 <= self.vector_index_neighbors <= 2048:
+                raise ValueError("vector_index_neighbors must be between 2 and 2048 for HNSW")
+            if not 1 <= self.vector_index_efconstruction <= 65535:
+                raise ValueError("vector_index_efconstruction must be between 1 and 65535 for HNSW")
+        elif not 1 <= self.vector_index_partitions <= 10_000_000:
+            raise ValueError("vector_index_partitions must be between 1 and 10000000 for IVF")
         return self
 
 
@@ -193,6 +238,12 @@ def validate_identifier(value: str, name: str) -> str:
 
 def text_index_name_for_table(table_name: str) -> str:
     return validate_identifier(f"idx_docs_{table_name}", "text_index_name")
+
+
+def vector_index_name_for_table(table_name: str) -> str:
+    suffix = "_vec_idx"
+    prefix_budget = ORACLE_VECTOR_INDEX_NAME_MAX_LENGTH - len(suffix)
+    return validate_identifier(f"{table_name[:prefix_budget]}{suffix}", "vector_index_name")
 
 
 def validate_top_k(value: Any, default: int) -> int:
@@ -370,6 +421,27 @@ def metadata_with_primary_key(metadata: dict[str, Any] | None) -> tuple[str, dic
     return doc_id, normalized_metadata
 
 
+def vector_index_parameters(config: OracleVectorConfig) -> str:
+    if config.vector_index_type == "HNSW":
+        return json.dumps(
+            {
+                "type": "HNSW",
+                "neighbors": config.vector_index_neighbors,
+                "efConstruction": config.vector_index_efconstruction,
+            }
+        )
+    return json.dumps({"type": "IVF", "partitions": config.vector_index_partitions})
+
+
+def is_hnsw_vector_memory_error(exc: Exception) -> bool:
+    candidates = (exc, *getattr(exc, "args", ()))
+    return any(
+        str(getattr(candidate, "full_code", "")) == ORACLE_HNSW_MEMORY_ERROR_CODE
+        or ORACLE_HNSW_MEMORY_ERROR_CODE in str(candidate)
+        for candidate in candidates
+    )
+
+
 def extract_english_text_tokens(query: str) -> list[str]:
     try:
         import nltk  # type: ignore
@@ -394,6 +466,7 @@ class OracleVector(BaseVector):
         super().__init__(collection_name)
         self.table_name = validate_identifier(f"embedding_{collection_name}", "table_name")
         self.text_index_name = text_index_name_for_table(self.table_name)
+        self.vector_index_name = vector_index_name_for_table(self.table_name)
         self.config = config
         self.pool = self._get_or_create_connection_pool(config)
 
@@ -509,11 +582,30 @@ class OracleVector(BaseVector):
 
     @override
     def create(self, texts: list[Document], embeddings: list[list[float]], **kwargs):
+        """Store embeddings before creating the optional approximate vector index.
+
+        Oracle commits document DML before vector-index DDL begins. If index creation fails, the documents remain
+        stored, while the readiness cache is cleared so a later initialization retries and surfaces the failure.
+        """
         dimension = validate_document_embeddings(texts, embeddings)
         if dimension == 0:
             return []
-        self._create_collection(dimension)
-        return self.add_texts(texts, embeddings)
+        try:
+            self._create_collection(dimension)
+            primary_keys = self.add_texts(texts, embeddings)
+            if not primary_keys:
+                self._clear_collection_ready()
+                return primary_keys
+            if self.config.enable_vector_index:
+                self._ensure_vector_index()
+        except Exception:
+            try:
+                self._clear_collection_ready()
+            except Exception:
+                logger.exception("Failed to clear Oracle collection-ready cache after initialization failed")
+            raise
+        self._mark_collection_ready(dimension)
+        return primary_keys
 
     @override
     def add_texts(self, documents: list[Document], embeddings: list[list[float]], **kwargs):
@@ -634,6 +726,12 @@ class OracleVector(BaseVector):
         metadata_condition = kwargs.get("metadata_condition") or kwargs.get("metadata_filtering_conditions")
         build_metadata_condition_filter(metadata_condition, {})
         score_threshold = float(kwargs.get("score_threshold") or 0.0)
+        if self.config.enable_vector_index:
+            fetch_clause = (
+                f"fetch approx first {top_k} rows only with target accuracy {self.config.vector_index_accuracy}"
+            )
+        else:
+            fetch_clause = f"fetch exact first {top_k} rows only"
 
         def read() -> list[Document]:
             top_documents: list[tuple[float, int, Document]] = []
@@ -649,9 +747,9 @@ class OracleVector(BaseVector):
                         where_clause = build_where_clause([document_filter, metadata_filter])
                         cur.execute(
                             f"""SELECT meta, text, vector_distance(embedding,
-                            (select to_vector(:query_vector) from dual),cosine)
+                            (select to_vector(:query_vector) from dual),COSINE)
                             AS distance FROM {self.table_name}
-                            {where_clause} ORDER BY distance fetch first {top_k} rows only""",
+                            {where_clause} ORDER BY distance {fetch_clause}""",
                             params,
                         )
                         for record in cur:
@@ -830,9 +928,22 @@ class OracleVector(BaseVector):
         if not lexer_row or str(lexer_row[0]).upper() != ORACLE_TEXT_LEXER_PREFERENCE:
             raise RuntimeError(f"Oracle Text index {self.text_index_name} does not use WORLD_LEXER.")
 
+    def _collection_cache_key(self) -> str:
+        return collection_cache_key(self._collection_name, self.config)
+
+    def _mark_collection_ready(self, dimension: int) -> None:
+        redis_client.set(
+            self._collection_cache_key(),
+            collection_dimension_cache_value(dimension),
+            ex=3600,
+        )
+
+    def _clear_collection_ready(self) -> None:
+        redis_client.delete(self._collection_cache_key())
+
     def _create_collection(self, dimension: int):
-        """Create or validate a collection before writes and cache only a fully valid schema."""
-        cache_key = collection_cache_key(self._collection_name, self.config)
+        """Create or validate collection structures without declaring initialization complete."""
+        cache_key = self._collection_cache_key()
         lock_name = f"{cache_key}_lock"
         with redis_client.lock(lock_name, timeout=20):
             if cache_matches_collection_dimension(redis_client.get(cache_key), dimension):
@@ -851,11 +962,103 @@ class OracleVector(BaseVector):
                     cur.execute(SQL_CREATE_INDEX.format(table_name=self.table_name, index_name=self.text_index_name))
                     self._validate_text_index(cur)
                 conn.commit()
-                redis_client.set(
-                    cache_key,
-                    collection_dimension_cache_value(dimension),
-                    ex=3600,
+
+    def _ensure_vector_index(self) -> None:
+        """Serialize vector-index DDL and commit only after the resulting index is verified as healthy."""
+        lock_name = f"oracle_vector_index_{self._collection_name}_lock"
+        with redis_client.lock(lock_name, timeout=ORACLE_VECTOR_INDEX_LOCK_TIMEOUT):
+            with self._get_connection() as conn:
+                self._create_vector_index(conn)
+                conn.commit()
+
+    def _create_vector_index(self, conn: Connection) -> None:
+        expected_subtype = ORACLE_VECTOR_INDEX_SUBTYPES[self.config.vector_index_type]
+        with conn.cursor() as cur:
+            index_details = self._get_vector_index_details(cur)
+            if index_details is not None:
+                self._assert_vector_index_healthy(index_details, expected_subtype)
+                return
+
+            try:
+                cur.execute(
+                    """
+                    BEGIN
+                        DBMS_VECTOR.CREATE_INDEX(
+                            idx_name => :index_name,
+                            table_name => :table_name,
+                            idx_vector_col => :idx_vector_col,
+                            idx_include_cols => NULL,
+                            idx_partitioning_scheme => :idx_partitioning_scheme,
+                            idx_organization => :idx_organization,
+                            idx_distance_metric => :idx_distance_metric,
+                            idx_accuracy => :idx_accuracy,
+                            idx_parameters => :idx_parameters,
+                            idx_parallel_creation => 1
+                        );
+                    END;
+                    """,
+                    index_name=self.vector_index_name,
+                    table_name=self.table_name,
+                    idx_vector_col="embedding",
+                    idx_partitioning_scheme="GLOBAL" if self.config.vector_index_type == "IVF" else None,
+                    idx_organization=ORACLE_VECTOR_INDEX_ORGANIZATIONS[self.config.vector_index_type],
+                    idx_distance_metric=ORACLE_VECTOR_INDEX_DISTANCE,
+                    idx_accuracy=self.config.vector_index_accuracy,
+                    idx_parameters=vector_index_parameters(self.config),
                 )
+            except Exception as exc:
+                if self.config.vector_index_type == "HNSW" and is_hnsw_vector_memory_error(exc):
+                    raise OracleVectorIndexError(
+                        "Oracle HNSW vector index creation requires sufficient Vector Pool capacity; "
+                        "increase VECTOR_MEMORY_SIZE on self-managed Oracle databases or select IVF"
+                    ) from exc
+                raise
+
+            index_details = self._get_vector_index_details(cur)
+            if index_details is None:
+                raise OracleVectorIndexError(
+                    f"Oracle vector index {self.vector_index_name} was not visible in USER_INDEXES after creation"
+                )
+            self._assert_vector_index_healthy(index_details, expected_subtype)
+
+    def _get_vector_index_details(self, cursor) -> tuple[str, str, str | None, str] | None:
+        cursor.execute(
+            """
+            SELECT TABLE_NAME, INDEX_TYPE, INDEX_SUBTYPE, STATUS
+            FROM USER_INDEXES
+            WHERE INDEX_NAME = :index_name
+            """,
+            index_name=self.vector_index_name.upper(),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        table_name, index_type, index_subtype, status = row
+        return (
+            str(table_name).upper(),
+            str(index_type).upper(),
+            str(index_subtype).upper() if index_subtype is not None else None,
+            str(status).upper(),
+        )
+
+    def _assert_vector_index_healthy(
+        self,
+        index_details: tuple[str, str, str | None, str],
+        expected_subtype: str,
+    ) -> None:
+        table_name, index_type, index_subtype, status = index_details
+        expected_table_name = self.table_name.upper()
+        if (
+            table_name != expected_table_name
+            or index_type != "VECTOR"
+            or index_subtype != expected_subtype
+            or status != "VALID"
+        ):
+            raise OracleVectorIndexError(
+                f"Oracle index {self.vector_index_name} is not a healthy {self.config.vector_index_type} index "
+                f"for {self.table_name}: table={table_name}, type={index_type}, "
+                f"subtype={index_subtype}, status={status}; drop or rebuild the index before retrying"
+            )
 
 
 class OracleVectorFactory(AbstractVectorFactory):
@@ -884,5 +1087,12 @@ class OracleVectorFactory(AbstractVectorFactory):
                 pool_max=getattr(dify_config, "ORACLE_POOL_MAX", 5),
                 pool_increment=getattr(dify_config, "ORACLE_POOL_INCREMENT", 1),
                 pool_ping_interval=getattr(dify_config, "ORACLE_POOL_PING_INTERVAL", 0),
+                enable_vector_index=getattr(dify_config, "ORACLE_ENABLE_VECTOR_INDEX", False),
+                vector_index_type=getattr(dify_config, "ORACLE_VECTOR_INDEX_TYPE", "IVF"),
+                vector_index_distance=getattr(dify_config, "ORACLE_VECTOR_INDEX_DISTANCE", "COSINE"),
+                vector_index_accuracy=getattr(dify_config, "ORACLE_VECTOR_INDEX_ACCURACY", 95),
+                vector_index_neighbors=getattr(dify_config, "ORACLE_VECTOR_INDEX_NEIGHBORS", 32),
+                vector_index_efconstruction=getattr(dify_config, "ORACLE_VECTOR_INDEX_EFCONSTRUCTION", 200),
+                vector_index_partitions=getattr(dify_config, "ORACLE_VECTOR_INDEX_PARTITIONS", 64),
             ),
         )
