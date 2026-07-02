@@ -1010,6 +1010,21 @@ def test_metadata_in_filter_accepts_limit_boundary(oracle_module):
     assert len(params) == oracle_module.ORACLE_IN_CLAUSE_BATCH_SIZE
 
 
+def test_metadata_condition_filter_enforces_aggregate_bind_limit(oracle_module):
+    first_values = [f"first-{index}" for index in range(450)]
+    second_values = [f"second-{index}" for index in range(451)]
+    condition = SimpleNamespace(
+        logical_operator="and",
+        conditions=[
+            SimpleNamespace(name="region", comparison_operator="in", value=first_values),
+            SimpleNamespace(name="category", comparison_operator="in", value=second_values),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="at most 900 bound values per query"):
+        oracle_module.build_metadata_condition_filter(condition, {})
+
+
 @pytest.mark.parametrize(("operator", "sql_operator"), [("before", "<"), ("after", ">")])
 def test_metadata_time_filters_use_unix_timestamp_numbers(oracle_module, operator, sql_operator):
     timestamp = 1735689600
