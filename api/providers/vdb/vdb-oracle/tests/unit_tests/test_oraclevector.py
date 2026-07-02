@@ -985,6 +985,7 @@ def test_search_by_vector_merges_global_top_k_across_document_filter_batches(ora
 def test_search_by_vector_retries_broken_pipe_without_retaining_partial_results(oracle_module):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
+    vector.config = _config(oracle_module)
     vector.input_type_handler = MagicMock()
     vector.output_type_handler = MagicMock()
 
@@ -1969,6 +1970,22 @@ def test_create_vector_index_creates_configured_hnsw(oracle_module):
     assert vector_index_call.kwargs["idx_partitioning_scheme"] is None
     assert vector_index_call.kwargs["idx_organization"] == "INMEMORY NEIGHBOR GRAPH"
     assert vector_index_call.kwargs["idx_parameters"] == '{"type": "HNSW", "neighbors": 16, "efConstruction": 128}'
+
+
+def test_create_vector_index_rejects_index_not_visible_after_creation(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.vector_index_name = "embedding_collection_1_vec_idx"
+    vector.config = _config(oracle_module, enable_vector_index=True)
+
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [None, None]
+
+    with pytest.raises(oracle_module.OracleVectorIndexError, match="was not visible in USER_INDEXES"):
+        vector._create_vector_index(_connection_with_cursor(cursor))
+
+    assert sum("DBMS_VECTOR.CREATE_INDEX" in call.args[0] for call in cursor.execute.call_args_list) == 1
+    assert sum("USER_INDEXES" in call.args[0] for call in cursor.execute.call_args_list) == 2
 
 
 def test_create_vector_index_skips_existing_healthy_index(oracle_module):
